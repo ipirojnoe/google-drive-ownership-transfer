@@ -1,0 +1,12 @@
+.env
+credentials/*
+!credentials/.gitkeep
+tokens/*
+!tokens/.gitkeep
+logs/*
+!logs/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
