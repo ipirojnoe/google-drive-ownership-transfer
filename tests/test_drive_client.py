@@ -3,8 +3,8 @@ from unittest.mock import Mock, patch
 
 from googleapiclient.errors import HttpError
 
-from src.drive_client import DriveClient
-from transfer_all import get_next_stream_item, get_remaining_stream_items, transfer_item
+from src.drive_client import DriveClient, SharingQuotaExceededError
+from transfer_all import get_next_stream_item, get_remaining_stream_items, transfer_item, transfer_or_stop
 
 
 class FakeHttpResponse:
@@ -238,6 +238,93 @@ class DriveClientRemoveAccessTests(TestCase):
         self.assertEqual(permissions_api.update_calls, [])
         self.assertEqual(permissions_api.create_calls, [])
 
+    def test_cleanup_source_access_prioritizes_folders_then_files(self):
+        client = DriveClient.__new__(DriveClient)
+        client.label = "target"
+        client._my_email = "target@example.com"
+        client._list_items_shared_with_user = Mock(
+            side_effect=[
+                ([{
+                    "id": "folder-1",
+                    "name": "Folder",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "owners": [{"emailAddress": "target@example.com"}],
+                }], None),
+                ([{
+                    "id": "file-1",
+                    "name": "File",
+                    "mimeType": "text/plain",
+                    "owners": [{"emailAddress": "target@example.com"}],
+                }], None),
+            ]
+        )
+        client.remove_access = Mock(side_effect=[True, True])
+
+        removed = client.cleanup_source_access("source@example.com", limit=10)
+
+        self.assertEqual(removed, 2)
+        client.remove_access.assert_any_call("folder-1", "source@example.com")
+        client.remove_access.assert_any_call("file-1", "source@example.com")
+        self.assertEqual(client.remove_access.call_args_list[0].args[0], "folder-1")
+        self.assertEqual(client.remove_access.call_args_list[1].args[0], "file-1")
+
+    def test_cleanup_removes_all_folders_before_files_even_over_limit(self):
+        client = DriveClient.__new__(DriveClient)
+        client.label = "target"
+        client._my_email = "target@example.com"
+        client._list_items_shared_with_user = Mock(
+            side_effect=[
+                ([{
+                    "id": "folder-1",
+                    "name": "Folder 1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "owners": [{"emailAddress": "target@example.com"}],
+                }], "more-folders"),
+                ([{
+                    "id": "folder-2",
+                    "name": "Folder 2",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "owners": [{"emailAddress": "target@example.com"}],
+                }], None),
+                ([{
+                    "id": "file-1",
+                    "name": "File 1",
+                    "mimeType": "text/plain",
+                    "owners": [{"emailAddress": "target@example.com"}],
+                }], None),
+            ]
+        )
+        client.remove_access = Mock(side_effect=[True, True, True])
+
+        removed = client.cleanup_source_access("source@example.com", limit=1)
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(client.remove_access.call_count, 2)
+        self.assertEqual(client.remove_access.call_args_list[0].args[0], "folder-1")
+        self.assertEqual(client.remove_access.call_args_list[1].args[0], "folder-2")
+
+    def test_cleanup_skips_items_not_owned_by_target(self):
+        client = DriveClient.__new__(DriveClient)
+        client.label = "target"
+        client._my_email = "target@example.com"
+        client._list_items_shared_with_user = Mock(
+            side_effect=[
+                ([{
+                    "id": "folder-1",
+                    "name": "Folder",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "owners": [{"emailAddress": "other@example.com"}],
+                }], None),
+                ([], None),
+            ]
+        )
+        client.remove_access = Mock()
+
+        removed = client.cleanup_source_access("source@example.com", limit=10)
+
+        self.assertEqual(removed, 0)
+        client.remove_access.assert_not_called()
+
 
 class TransferItemTests(TestCase):
     def test_does_not_fail_when_source_access_is_only_inherited(self):
@@ -275,6 +362,131 @@ class TransferItemTests(TestCase):
             ["parent-1"],
             "staging-1",
         )
+
+    def test_reraises_sharing_quota_error_after_rollback(self):
+        source_client = Mock()
+        target_client = Mock()
+        source_client.stage_item_if_needed.return_value = {
+            "staged": True,
+            "original_parents": ["parent-1"],
+            "staging_parent": "staging-1",
+        }
+        source_client.initiate_ownership_transfer.side_effect = SharingQuotaExceededError("quota")
+
+        failed: list[dict] = []
+        with self.assertRaises(SharingQuotaExceededError):
+            transfer_item(
+                {
+                    "id": "file-5",
+                    "name": "quota-hit",
+                    "size": "100",
+                    "mimeType": "application/octet-stream",
+                },
+                1,
+                "?",
+                source_client,
+                target_client,
+                "source@example.com",
+                "target@example.com",
+                True,
+                failed,
+            )
+
+        source_client.restore_item_parents.assert_called_once_with(
+            "file-5",
+            ["parent-1"],
+            "staging-1",
+        )
+        self.assertEqual(len(failed), 1)
+
+    def test_transfer_or_stop_reraises_quota_error(self):
+        source_client = Mock()
+        target_client = Mock()
+        source_client.stage_item_if_needed.return_value = {
+            "staged": False,
+            "original_parents": [],
+            "staging_parent": None,
+        }
+        source_client.initiate_ownership_transfer.side_effect = SharingQuotaExceededError("quota")
+        target_client.cleanup_source_access.return_value = 0
+
+        failed: list[dict] = []
+        with self.assertRaises(SharingQuotaExceededError):
+            transfer_or_stop(
+                {
+                    "id": "file-6",
+                    "name": "quota-hit",
+                    "size": "100",
+                    "mimeType": "application/octet-stream",
+                },
+                1,
+                "?",
+                source_client,
+                target_client,
+                "source@example.com",
+                "target@example.com",
+                True,
+                failed,
+            )
+
+    def test_transfer_or_stop_cleans_up_and_retries_after_quota_error(self):
+        source_client = Mock()
+        target_client = Mock()
+        failed: list[dict] = []
+        item = {
+            "id": "file-7",
+            "name": "quota-then-ok",
+            "size": "100",
+            "mimeType": "application/octet-stream",
+        }
+
+        with patch("transfer_all.transfer_item", side_effect=[SharingQuotaExceededError("quota"), True]) as mocked_transfer:
+            target_client.cleanup_source_access.return_value = 3
+            with patch("transfer_all.time.sleep", return_value=None):
+                ok = transfer_or_stop(
+                    item,
+                    1,
+                    "?",
+                    source_client,
+                    target_client,
+                    "source@example.com",
+                    "target@example.com",
+                    True,
+                    failed,
+                )
+
+        self.assertTrue(ok)
+        self.assertEqual(mocked_transfer.call_count, 2)
+        target_client.cleanup_source_access.assert_called_once_with(
+            "source@example.com",
+            limit=200,
+        )
+
+    def test_transfer_or_stop_stops_if_cleanup_frees_nothing(self):
+        source_client = Mock()
+        target_client = Mock()
+        failed: list[dict] = []
+        item = {
+            "id": "file-8",
+            "name": "quota-no-cleanup",
+            "size": "100",
+            "mimeType": "application/octet-stream",
+        }
+
+        with patch("transfer_all.transfer_item", side_effect=SharingQuotaExceededError("quota")):
+            target_client.cleanup_source_access.return_value = 0
+            with self.assertRaises(SharingQuotaExceededError):
+                transfer_or_stop(
+                    item,
+                    1,
+                    "?",
+                    source_client,
+                    target_client,
+                    "source@example.com",
+                    "target@example.com",
+                    True,
+                    failed,
+                )
 
 
 class StreamOrderingTests(TestCase):

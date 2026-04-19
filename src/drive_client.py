@@ -1,4 +1,5 @@
 import time
+import json
 from typing import Any
 
 from googleapiclient.discovery import build
@@ -13,6 +14,27 @@ WRITER_ROLE_WAIT_TIMEOUT = 20.0
 WRITER_ROLE_POLL_INTERVAL = 1.0
 PENDING_OWNER_RETRIES = 5
 STAGING_FOLDER_NAME = ".ownership-transfer-staging"
+CLEANUP_PAGE_SIZE = 100
+
+
+class SharingQuotaExceededError(RuntimeError):
+    """Raised when Drive rejects new shares because the account hit the sharing quota."""
+
+
+def get_http_error_reason(exc: HttpError) -> str | None:
+    try:
+        payload = json.loads(exc.content.decode("utf-8"))
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    errors = payload.get("error", {}).get("errors", [])
+    if not errors:
+        return None
+    return errors[0].get("reason")
+
+
+def is_sharing_quota_error(exc: HttpError) -> bool:
+    return get_http_error_reason(exc) == "sharingRateLimitExceeded"
 
 
 
@@ -21,6 +43,7 @@ class DriveClient:
         self._credentials = credentials
         self.service = build("drive", "v3", credentials=credentials)
         self.label = account_label
+        self._my_email: str | None = None
 
     def clone(self) -> "DriveClient":
         """Create a new client with a separate service object.
@@ -120,6 +143,12 @@ class DriveClient:
         meta = self.get_file(file_id, "id, parents")
         return meta.get("parents", [])
 
+    def get_my_email(self) -> str:
+        if self._my_email is None:
+            about = self.service.about().get(fields="user(emailAddress)").execute()
+            self._my_email = about["user"]["emailAddress"]
+        return self._my_email
+
     def _wait_until_target_not_inherited(
         self, file_id: str, target_email: str
     ) -> None:
@@ -197,6 +226,119 @@ class DriveClient:
         if remove_parents:
             kwargs["removeParents"] = ",".join(remove_parents)
         return self.service.files().update(**kwargs).execute()
+
+    def _list_items_shared_with_user(
+        self,
+        email: str,
+        *,
+        folder_only: bool,
+        page_token: str | None = None,
+        page_size: int = CLEANUP_PAGE_SIZE,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        mime_filter = (
+            "mimeType = 'application/vnd.google-apps.folder'"
+            if folder_only
+            else "mimeType != 'application/vnd.google-apps.folder'"
+        )
+        query = (
+            "trashed = false and "
+            f"{mime_filter} and "
+            f"('{email}' in writers or '{email}' in readers)"
+        )
+        kwargs: dict[str, Any] = {
+            "pageSize": page_size,
+            "q": query,
+            "fields": "nextPageToken, files(id, name, mimeType, size, owners(emailAddress))",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        response = self.service.files().list(**kwargs).execute()
+        return response.get("files", []), response.get("nextPageToken")
+
+    def _is_owned_by_me(self, item: dict[str, Any]) -> bool:
+        my_email = self.get_my_email().lower()
+        owners = item.get("owners", [])
+        return any(owner.get("emailAddress", "").lower() == my_email for owner in owners)
+
+    def cleanup_source_access(
+        self, source_email: str, limit: int
+    ) -> int:
+        removed = 0
+
+        logger.info("[%s] Cleanup: scanning folders shared with %s...", self.label, source_email)
+        removed += self._cleanup_source_access_scope(
+            source_email,
+            folder_only=True,
+            limit=None,
+        )
+
+        remaining_limit = max(limit - removed, 0)
+        if remaining_limit > 0:
+            logger.info(
+                "[%s] Cleanup: scanning files shared with %s (remaining limit %d)...",
+                self.label,
+                source_email,
+                remaining_limit,
+            )
+            removed += self._cleanup_source_access_scope(
+                source_email,
+                folder_only=False,
+                limit=remaining_limit,
+            )
+
+        logger.info("[%s] Cleanup finished: removed %d source shares", self.label, removed)
+        return removed
+
+    def _cleanup_source_access_scope(
+        self,
+        source_email: str,
+        *,
+        folder_only: bool,
+        limit: int | None,
+    ) -> int:
+        removed = 0
+        page_token = None
+
+        while limit is None or removed < limit:
+            page_size = CLEANUP_PAGE_SIZE if limit is None else min(CLEANUP_PAGE_SIZE, limit - removed)
+            items, page_token = self._list_items_shared_with_user(
+                source_email,
+                folder_only=folder_only,
+                page_token=page_token,
+                page_size=page_size,
+            )
+            if not items:
+                break
+
+            for item in items:
+                if limit is not None and removed >= limit:
+                    break
+
+                if not self._is_owned_by_me(item):
+                    logger.debug(
+                        "[%s] Cleanup skipping %s '%s': not owned by current account",
+                        self.label,
+                        "folder" if folder_only else "file",
+                        item.get("name", item["id"]),
+                    )
+                    continue
+
+                removed_access = self.remove_access(item["id"], source_email)
+                if removed_access:
+                    removed += 1
+                    logger.info(
+                        "[%s] Cleanup removed source access from %s '%s'%s",
+                        self.label,
+                        "folder" if folder_only else "file",
+                        item.get("name", item["id"]),
+                        "" if limit is None else f" ({removed}/{limit})",
+                    )
+
+            if not page_token:
+                break
+
+        return removed
 
     def stage_item_if_needed(
         self, file_id: str, target_email: str
@@ -401,6 +543,12 @@ class DriveClient:
             result = self._mark_pending_owner(file_id, perm_id, target_email)
 
         except HttpError as exc:
+            if is_sharing_quota_error(exc):
+                logger.error(
+                    "[%s] Sharing quota exceeded while initiating transfer for file %s: %s",
+                    self.label, file_id, exc,
+                )
+                raise SharingQuotaExceededError(str(exc)) from exc
             logger.error(
                 "[%s] Failed to initiate transfer for file %s: %s",
                 self.label, file_id, exc,

@@ -57,6 +57,14 @@ graph TD
     Y -->|No| AA["Keep inherited source access"]
     Z --> X
     AA --> X
+
+    R --> AB{"sharingRateLimitExceeded?"}
+    AB -->|Yes| AC["On TARGET, scan folders shared with SOURCE"]
+    AC --> AD["Try to remove SOURCE from target-owned folders first"]
+    AD --> AE["Then scan files shared with SOURCE"]
+    AE --> AF["Try to remove SOURCE from target-owned files"]
+    AF --> AG["Retry current transfer"]
+    AB -->|No| S
 ```
 
 Short version:
@@ -65,6 +73,7 @@ Short version:
 - If the target account only has inherited access, the script temporarily moves the item into a staging folder so Drive will allow `pendingOwner`.
 - After the target accepts ownership, the script restores the original parent folders.
 - If `REMOVE_SOURCE_ACCESS=1`, the script removes direct source access when possible. Inherited access on parent folders cannot be deleted at file level.
+- If Google returns `sharingRateLimitExceeded`, the script switches to cleanup mode on the target account: it scans folders shared with the source first, then files, removes direct source access where possible, and retries the blocked item.
 
 **Before you run**
 1. In Google Cloud Console, create or select a project.

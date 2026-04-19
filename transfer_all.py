@@ -29,7 +29,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.auth import get_credentials
-from src.drive_client import DriveClient
+from src.drive_client import DriveClient, SharingQuotaExceededError
 from src.logger import get_logger
 
 logger = get_logger("transfer_all")
@@ -37,6 +37,8 @@ logger = get_logger("transfer_all")
 DELAY_BETWEEN_FILES = 0.3
 PAGE_SIZE = 500
 FOLDER_MIME = "application/vnd.google-apps.folder"
+QUOTA_RECOVERY_BATCH_SIZE = 200
+QUOTA_RECOVERY_ATTEMPTS = 5
 
 
 # ------------------------------------------------------------------
@@ -174,6 +176,26 @@ def transfer_item(
             logger.info("  ✓ transferred")
 
         return True
+    except SharingQuotaExceededError as exc:
+        if staging and staging.get("staged") and not transfer_completed:
+            try:
+                source_client.restore_item_parents(
+                    file_id,
+                    staging["original_parents"],
+                    staging["staging_parent"],
+                )
+                logger.warning("  ↺ staging rollback completed")
+            except Exception as rollback_exc:
+                logger.error("  ! staging rollback failed: %s", rollback_exc)
+        logger.warning("  ✗ fatal quota error: %s", exc)
+        failed.append({
+            "id": file_id,
+            "name": file_name,
+            "size": f.get("size"),
+            "is_folder": f.get("mimeType") == FOLDER_MIME,
+            "error": str(exc),
+        })
+        raise
     except Exception as exc:
         if staging and staging.get("staged") and not transfer_completed:
             try:
@@ -194,6 +216,62 @@ def transfer_item(
             "error": str(exc),
         })
         return False
+
+
+def transfer_or_stop(
+    f: dict,
+    index: int,
+    total: str,
+    source_client: DriveClient,
+    target_client: DriveClient,
+    source_email: str,
+    target_email: str,
+    remove_source_access: bool,
+    failed: list[dict],
+) -> bool:
+    for attempt in range(1, QUOTA_RECOVERY_ATTEMPTS + 1):
+        try:
+            return transfer_item(
+                f,
+                index,
+                total,
+                source_client,
+                target_client,
+                source_email,
+                target_email,
+                remove_source_access,
+                failed,
+            )
+        except SharingQuotaExceededError:
+            logger.warning(
+                "Sharing quota exceeded while processing '%s' (attempt %d/%d). "
+                "Cleaning up source access from target-side shared items...",
+                f.get("name", f["id"]),
+                attempt,
+                QUOTA_RECOVERY_ATTEMPTS,
+            )
+            removed = target_client.cleanup_source_access(
+                source_email,
+                limit=QUOTA_RECOVERY_BATCH_SIZE,
+            )
+            if removed <= 0:
+                logger.error(
+                    "Stopping the run because Google Drive returned sharingRateLimitExceeded "
+                    "and cleanup did not free any target-owned shared items from source access. Retry later."
+                )
+                raise
+
+            logger.info(
+                "Cleanup removed %d target-side source shares. Retrying the current item...",
+                removed,
+            )
+            time.sleep(DELAY_BETWEEN_FILES)
+
+    logger.error(
+        "Stopping the run because sharingRateLimitExceeded persisted after %d cleanup attempts.",
+        QUOTA_RECOVERY_ATTEMPTS,
+    )
+    raise SharingQuotaExceededError("sharing quota still exceeded after cleanup retries")
 
 
 # ------------------------------------------------------------------
@@ -229,108 +307,112 @@ def main() -> None:
 
     transferred = 0
     failed: list[dict] = []
+    stopped_due_to_quota = False
 
-    if stream:
-        # ------------------------------------------------------------------
-        # Stream mode:
-        #   1. After each page, transfer the largest seen-so-far item.
-        #   2. After pagination completes, transfer the remaining items
-        #      in global size order.
-        # ------------------------------------------------------------------
-        logger.info(
-            "STREAM mode: transfer the largest seen-so-far item after each page, "
-            "then finish the remaining items..."
-        )
-        index = 0
-        all_items: list[dict] = []
-        processed_ids: set[str] = set()
-
-        for batch in iter_pages(source_client):
-            all_items.extend(batch)
-            if not batch:
-                continue
-
-            largest = get_next_stream_item(all_items, processed_ids)
-            if largest is None:
-                continue
-            index += 1
-            processed_ids.add(largest["id"])
-
-            if dry_run:
-                logger.info("%5d. %-10s  %s", index, fmt_size(largest.get("size")), largest.get("name", "—"))
-                continue
-
-            ok = transfer_item(
-                largest, index, "?",
-                source_client, target_client,
-                source_email, target_email,
-                remove_source_access, failed,
-            )
-            if ok:
-                transferred += 1
-            time.sleep(DELAY_BETWEEN_FILES)
-
-        remaining = get_remaining_stream_items(all_items, processed_ids)
-        if remaining:
+    try:
+        if stream:
+            # ------------------------------------------------------------------
+            # Stream mode:
+            #   1. After each page, transfer the largest seen-so-far item.
+            #   2. After pagination completes, transfer the remaining items
+            #      in global size order.
+            # ------------------------------------------------------------------
             logger.info(
-                "STREAM: pagination finished, transferring %d remaining items in global size order...",
-                len(remaining),
+                "STREAM mode: transfer the largest seen-so-far item after each page, "
+                "then finish the remaining items..."
+            )
+            index = 0
+            all_items: list[dict] = []
+            processed_ids: set[str] = set()
+
+            for batch in iter_pages(source_client):
+                all_items.extend(batch)
+                if not batch:
+                    continue
+
+                largest = get_next_stream_item(all_items, processed_ids)
+                if largest is None:
+                    continue
+                index += 1
+                processed_ids.add(largest["id"])
+
+                if dry_run:
+                    logger.info("%5d. %-10s  %s", index, fmt_size(largest.get("size")), largest.get("name", "—"))
+                    continue
+
+                ok = transfer_or_stop(
+                    largest, index, "?",
+                    source_client, target_client,
+                    source_email, target_email,
+                    remove_source_access, failed,
+                )
+                if ok:
+                    transferred += 1
+                time.sleep(DELAY_BETWEEN_FILES)
+
+            remaining = get_remaining_stream_items(all_items, processed_ids)
+            if remaining:
+                logger.info(
+                    "STREAM: pagination finished, transferring %d remaining items in global size order...",
+                    len(remaining),
+                )
+
+            total = len(all_items)
+            for f in remaining:
+                index += 1
+
+                if dry_run:
+                    logger.info("%5d. %-10s  %s", index, fmt_size(f.get("size")), f.get("name", "—"))
+                    continue
+
+                ok = transfer_or_stop(
+                    f, index, total,
+                    source_client, target_client,
+                    source_email, target_email,
+                    remove_source_access, failed,
+                )
+                if ok:
+                    transferred += 1
+                time.sleep(DELAY_BETWEEN_FILES)
+
+        else:
+            # ------------------------------------------------------------------
+            # Full-load mode: fetch all items first, then transfer
+            # ------------------------------------------------------------------
+            logger.info("Fetching the full list of source-owned files and folders...")
+            all_items = get_all_owned_items(source_client)
+            selected = sort_items(all_items)
+
+            with_size = sum(1 for f in selected if f.get("size"))
+            without_size = len(selected) - with_size
+            logger.info(
+                "Will transfer %d items (%d with size + %d folders/Google Docs)",
+                len(selected), with_size, without_size,
             )
 
-        total = len(all_items)
-        for f in remaining:
-            index += 1
+            if not selected:
+                logger.info("Nothing to transfer. Finished.")
+                return
 
             if dry_run:
-                logger.info("%5d. %-10s  %s", index, fmt_size(f.get("size")), f.get("name", "—"))
-                continue
+                logger.info("--- Dry run list ---")
+                for i, f in enumerate(selected, 1):
+                    logger.info("%5d. %-10s  %s  [%s]", i, fmt_size(f.get("size")), f.get("name", "—"), f.get("id", ""))
+                return
 
-            ok = transfer_item(
-                f, index, total,
-                source_client, target_client,
-                source_email, target_email,
-                remove_source_access, failed,
-            )
-            if ok:
-                transferred += 1
-            time.sleep(DELAY_BETWEEN_FILES)
-
-    else:
-        # ------------------------------------------------------------------
-        # Full-load mode: fetch all items first, then transfer
-        # ------------------------------------------------------------------
-        logger.info("Fetching the full list of source-owned files and folders...")
-        all_items = get_all_owned_items(source_client)
-        selected = sort_items(all_items)
-
-        with_size = sum(1 for f in selected if f.get("size"))
-        without_size = len(selected) - with_size
-        logger.info(
-            "Will transfer %d items (%d with size + %d folders/Google Docs)",
-            len(selected), with_size, without_size,
-        )
-
-        if not selected:
-            logger.info("Nothing to transfer. Finished.")
-            return
-
-        if dry_run:
-            logger.info("--- Dry run list ---")
+            total = len(selected)
             for i, f in enumerate(selected, 1):
-                logger.info("%5d. %-10s  %s  [%s]", i, fmt_size(f.get("size")), f.get("name", "—"), f.get("id", ""))
-            return
-
-        total = len(selected)
-        for i, f in enumerate(selected, 1):
-            ok = transfer_item(
-                f, i, total,
-                source_client, target_client,
-                source_email, target_email,
-                remove_source_access, failed,
-            )
-            if ok:
-                transferred += 1
-            time.sleep(DELAY_BETWEEN_FILES)
+                ok = transfer_or_stop(
+                    f, i, total,
+                    source_client, target_client,
+                    source_email, target_email,
+                    remove_source_access, failed,
+                )
+                if ok:
+                    transferred += 1
+                time.sleep(DELAY_BETWEEN_FILES)
+    except SharingQuotaExceededError:
+        stopped_due_to_quota = True
 
     # ------------------------------------------------------------------
     # Summary
@@ -342,6 +424,8 @@ def main() -> None:
     if failed:
         failed_path = save_failed(failed)
         logger.info("  Errors:      %s", failed_path)
+    if stopped_due_to_quota:
+        logger.info("  Stopped:     sharing quota exceeded, retry later")
     logger.info("=" * 60)
 
 
