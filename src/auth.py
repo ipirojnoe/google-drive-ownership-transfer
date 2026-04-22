@@ -5,6 +5,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from src.logger import get_logger
+from src.retry import retry_transient
 
 logger = get_logger(__name__)
 
@@ -44,7 +45,10 @@ def get_credentials(account: str) -> Credentials:
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             logger.info("Refreshing token for account '%s'...", account)
-            creds.refresh(Request())
+            retry_transient(
+                f"Refresh token for account '{account}'",
+                lambda: creds.refresh(Request()),
+            )
         else:
             logger.info("Starting OAuth flow for account '%s'...", account)
             flow = InstalledAppFlow.from_client_secrets_file(str(secret_path), SCOPES)

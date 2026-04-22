@@ -1,20 +1,24 @@
+import socket
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from googleapiclient.errors import HttpError
 
 from src.drive_client import DriveClient, SharingQuotaExceededError
+from src.retry import is_transient_error, retry_transient
 from transfer_all import get_next_stream_item, get_remaining_stream_items, transfer_item, transfer_or_stop
 
 
 class FakeHttpResponse:
-    status = 403
     reason = "Forbidden"
 
+    def __init__(self, status: int = 403):
+        self.status = status
 
-def make_http_error(reason: str) -> HttpError:
+
+def make_http_error(reason: str, status: int = 403) -> HttpError:
     return HttpError(
-        resp=FakeHttpResponse(),
+        resp=FakeHttpResponse(status),
         content=(
             '{"error":{"errors":[{"reason":"%s"}],"message":"%s"}}'
             % (reason, reason)
@@ -96,6 +100,29 @@ class FakeService:
 
     def permissions(self):
         return self._permissions_api
+
+
+class RetryTests(TestCase):
+    def test_retries_transient_network_errors(self):
+        calls = []
+
+        def operation():
+            calls.append("call")
+            if len(calls) == 1:
+                raise socket.gaierror("temporary dns failure")
+            return "ok"
+
+        with patch("src.retry.time.sleep", return_value=None):
+            self.assertEqual(
+                retry_transient("test operation", operation, attempts=2, base_delay=0),
+                "ok",
+            )
+
+        self.assertEqual(len(calls), 2)
+
+    def test_classifies_rate_limit_as_transient_but_not_sharing_quota(self):
+        self.assertTrue(is_transient_error(make_http_error("rateLimitExceeded")))
+        self.assertFalse(is_transient_error(make_http_error("sharingRateLimitExceeded")))
 
 
 class DriveClientInitiateOwnershipTransferTests(TestCase):
@@ -330,6 +357,10 @@ class TransferItemTests(TestCase):
     def test_does_not_fail_when_source_access_is_only_inherited(self):
         source_client = Mock()
         target_client = Mock()
+        source_client.get_file.return_value = {
+            "id": "file-4",
+            "owners": [{"emailAddress": "source@example.com"}],
+        }
         source_client.stage_item_if_needed.return_value = {
             "staged": True,
             "original_parents": ["parent-1"],
@@ -366,6 +397,10 @@ class TransferItemTests(TestCase):
     def test_reraises_sharing_quota_error_after_rollback(self):
         source_client = Mock()
         target_client = Mock()
+        source_client.get_file.return_value = {
+            "id": "file-5",
+            "owners": [{"emailAddress": "source@example.com"}],
+        }
         source_client.stage_item_if_needed.return_value = {
             "staged": True,
             "original_parents": ["parent-1"],
@@ -402,6 +437,10 @@ class TransferItemTests(TestCase):
     def test_transfer_or_stop_reraises_quota_error(self):
         source_client = Mock()
         target_client = Mock()
+        source_client.get_file.return_value = {
+            "id": "file-6",
+            "owners": [{"emailAddress": "source@example.com"}],
+        }
         source_client.stage_item_if_needed.return_value = {
             "staged": False,
             "original_parents": [],
@@ -428,6 +467,38 @@ class TransferItemTests(TestCase):
                 True,
                 failed,
             )
+
+    def test_skips_item_when_source_no_longer_owns_it(self):
+        source_client = Mock()
+        target_client = Mock()
+        source_client.get_file.return_value = {
+            "id": "file-9",
+            "owners": [{"emailAddress": "target@example.com"}],
+        }
+
+        failed: list[dict] = []
+        ok = transfer_item(
+            {
+                "id": "file-9",
+                "name": "already-transferred",
+                "size": "100",
+                "mimeType": "application/octet-stream",
+            },
+            1,
+            "?",
+            source_client,
+            target_client,
+            "source@example.com",
+            "target@example.com",
+            True,
+            failed,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(failed, [])
+        source_client.stage_item_if_needed.assert_not_called()
+        source_client.initiate_ownership_transfer.assert_not_called()
+        target_client.accept_ownership_transfer.assert_not_called()
 
     def test_transfer_or_stop_cleans_up_and_retries_after_quota_error(self):
         source_client = Mock()

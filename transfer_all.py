@@ -23,13 +23,14 @@ from pathlib import Path
 from datetime import datetime
 
 from dotenv import load_dotenv
+from googleapiclient.errors import HttpError
 
 load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.auth import get_credentials
-from src.drive_client import DriveClient, SharingQuotaExceededError
+from src.drive_client import DriveClient, SharingQuotaExceededError, get_http_error_reason
 from src.logger import get_logger
 
 logger = get_logger("transfer_all")
@@ -52,15 +53,10 @@ def iter_pages(client: DriveClient):
 
     while True:
         page_num += 1
-        kwargs = dict(
-            pageSize=PAGE_SIZE,
-            q="'me' in owners and trashed = false",
-            fields="nextPageToken, files(id, name, modifiedTime, mimeType, size)",
+        response = client.list_owned_items_page(
+            page_size=PAGE_SIZE,
+            page_token=page_token,
         )
-        if page_token:
-            kwargs["pageToken"] = page_token
-
-        response = client.service.files().list(**kwargs).execute()
         batch = response.get("files", [])
         logger.info("Page %d: %d items", page_num, len(batch))
         yield batch
@@ -131,6 +127,23 @@ def save_failed(failed: list[dict]) -> Path:
     return path
 
 
+def is_owned_by_source(source_client: DriveClient, file_id: str, source_email: str) -> bool:
+    try:
+        meta = source_client.get_file(file_id, "id, owners(emailAddress)")
+    except HttpError as exc:
+        reason = get_http_error_reason(exc)
+        status = getattr(exc.resp, "status", None)
+        if status == 404 or reason in {"notFound", "fileNotFound", "insufficientFilePermissions"}:
+            return False
+        raise
+
+    source_email_lower = source_email.lower()
+    return any(
+        owner.get("emailAddress", "").lower() == source_email_lower
+        for owner in meta.get("owners", [])
+    )
+
+
 # ------------------------------------------------------------------
 # Single item transfer
 # ------------------------------------------------------------------
@@ -154,6 +167,10 @@ def transfer_item(
     logger.info("[%s/%s] %s  '%s'", index, total, fmt_size(f.get("size")), file_name)
 
     try:
+        if not is_owned_by_source(source_client, file_id, source_email):
+            logger.info("  - skipped, source no longer owns this item")
+            return False
+
         staging = source_client.stage_item_if_needed(file_id, target_email)
         source_client.initiate_ownership_transfer(file_id, target_email)
         target_client.accept_ownership_transfer(file_id, source_email)

@@ -65,7 +65,10 @@ def main() -> None:
     source_client = DriveClient(source_creds, account_label="source")
 
     # Confirm that the cached token belongs to the expected source account.
-    about = source_client.service.about().get(fields="user(emailAddress, displayName)").execute()
+    about = source_client._execute(
+        source_client.service.about().get(fields="user(emailAddress, displayName)"),
+        "Get source account profile",
+    )
     logged_as = about["user"]["emailAddress"]
     display = about["user"].get("displayName", "")
     logger.info("Authenticated as: %s (%s)", logged_as, display)

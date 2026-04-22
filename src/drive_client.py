@@ -7,6 +7,7 @@ from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 
 from src.logger import get_logger
+from src.retry import retry_transient
 
 logger = get_logger(__name__)
 
@@ -50,6 +51,10 @@ class DriveClient:
         Useful when multiple threads are used because httplib2 is not thread-safe."""
         return DriveClient(self._credentials, self.label)
 
+    def _execute(self, request: Any, operation: str) -> Any:
+        label = f"[{self.label}] " if self.label else ""
+        return retry_transient(f"{label}{operation}", request.execute)
+
     # ------------------------------------------------------------------
     # Files
     # ------------------------------------------------------------------
@@ -60,26 +65,42 @@ class DriveClient:
         sorted by modified date, newest first.
         Folders are excluded.
         """
-        results = (
+        results = self._execute(
             self.service.files()
             .list(
                 pageSize=limit,
                 orderBy="modifiedTime desc",
                 q="'me' in owners and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
                 fields="files(id, name, modifiedTime, mimeType, owners, size)",
-            )
-            .execute()
+            ),
+            "List recent files",
         )
         files = results.get("files", [])
         logger.debug("[%s] Files fetched: %d", self.label, len(files))
         return files
+
+    def list_owned_items_page(
+        self, *, page_size: int, page_token: str | None = None
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "pageSize": page_size,
+            "q": "'me' in owners and trashed = false",
+            "fields": "nextPageToken, files(id, name, modifiedTime, mimeType, size)",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        return self._execute(
+            self.service.files().list(**kwargs),
+            "List owned items",
+        )
 
     # ------------------------------------------------------------------
     # Permissions
     # ------------------------------------------------------------------
 
     def list_permissions(self, file_id: str) -> list[dict[str, Any]]:
-        results = (
+        results = self._execute(
             self.service.permissions()
             .list(
                 fileId=file_id,
@@ -89,8 +110,8 @@ class DriveClient:
                     "permissionDetails(permissionType, role, inherited)"
                     ")"
                 ),
-            )
-            .execute()
+            ),
+            f"List permissions for file {file_id}",
         )
         return results.get("permissions", [])
 
@@ -105,7 +126,7 @@ class DriveClient:
         )
 
     def _get_permission(self, file_id: str, permission_id: str) -> dict[str, Any]:
-        return (
+        return self._execute(
             self.service.permissions()
             .get(
                 fileId=file_id,
@@ -114,8 +135,8 @@ class DriveClient:
                     "id, emailAddress, role, type, pendingOwner, "
                     "permissionDetails(permissionType, role, inherited)"
                 ),
-            )
-            .execute()
+            ),
+            f"Get permission {permission_id} for file {file_id}",
         )
 
     def _permission_details(self, permission: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -137,7 +158,10 @@ class DriveClient:
         }
 
     def get_file(self, file_id: str, fields: str) -> dict[str, Any]:
-        return self.service.files().get(fileId=file_id, fields=fields).execute()
+        return self._execute(
+            self.service.files().get(fileId=file_id, fields=fields),
+            f"Get file {file_id}",
+        )
 
     def get_parents(self, file_id: str) -> list[str]:
         meta = self.get_file(file_id, "id, parents")
@@ -145,7 +169,10 @@ class DriveClient:
 
     def get_my_email(self) -> str:
         if self._my_email is None:
-            about = self.service.about().get(fields="user(emailAddress)").execute()
+            about = self._execute(
+                self.service.about().get(fields="user(emailAddress)"),
+                "Get current account email",
+            )
             self._my_email = about["user"]["emailAddress"]
         return self._my_email
 
@@ -181,20 +208,20 @@ class DriveClient:
             f"and name = '{STAGING_FOLDER_NAME}' "
             "and 'root' in parents and trashed = false"
         )
-        response = (
+        response = self._execute(
             self.service.files()
             .list(
                 q=query,
                 pageSize=1,
                 fields="files(id, name)",
-            )
-            .execute()
+            ),
+            "Find staging folder",
         )
         files = response.get("files", [])
         if files:
             return files[0]["id"]
 
-        created = (
+        created = self._execute(
             self.service.files()
             .create(
                 body={
@@ -203,8 +230,8 @@ class DriveClient:
                     "parents": ["root"],
                 },
                 fields="id",
-            )
-            .execute()
+            ),
+            "Create staging folder",
         )
         folder_id = created["id"]
         logger.info("[%s] Created staging folder: %s", self.label, folder_id)
@@ -225,7 +252,10 @@ class DriveClient:
             kwargs["addParents"] = ",".join(add_parents)
         if remove_parents:
             kwargs["removeParents"] = ",".join(remove_parents)
-        return self.service.files().update(**kwargs).execute()
+        return self._execute(
+            self.service.files().update(**kwargs),
+            f"Move file {file_id}",
+        )
 
     def _list_items_shared_with_user(
         self,
@@ -253,7 +283,10 @@ class DriveClient:
         if page_token:
             kwargs["pageToken"] = page_token
 
-        response = self.service.files().list(**kwargs).execute()
+        response = self._execute(
+            self.service.files().list(**kwargs),
+            f"List {'folders' if folder_only else 'files'} shared with {email}",
+        )
         return response.get("files", []), response.get("nextPageToken")
 
     def _is_owned_by_me(self, item: dict[str, Any]) -> bool:
@@ -440,15 +473,15 @@ class DriveClient:
                 return current
 
             try:
-                return (
+                return self._execute(
                     self.service.permissions()
                     .update(
                         fileId=file_id,
                         permissionId=permission_id,
                         body={"role": "writer", "pendingOwner": True},
                         fields="id, emailAddress, role, pendingOwner",
-                    )
-                    .execute()
+                    ),
+                    f"Mark pending owner for file {file_id}",
                 )
             except HttpError as exc:
                 if "pendingOwnerWriterRequired" not in str(exc):
@@ -514,12 +547,15 @@ class DriveClient:
                         perm_id,
                         target_email,
                     )
-                    self.service.permissions().update(
-                        fileId=file_id,
-                        permissionId=perm_id,
-                        body={"role": "writer"},
-                        fields="id, emailAddress, role, pendingOwner",
-                    ).execute()
+                    self._execute(
+                        self.service.permissions().update(
+                            fileId=file_id,
+                            permissionId=perm_id,
+                            body={"role": "writer"},
+                            fields="id, emailAddress, role, pendingOwner",
+                        ),
+                        f"Set writer permission for file {file_id}",
+                    )
                 else:
                     logger.debug(
                         "[%s] Permission id=%s for %s is already writer",
@@ -529,15 +565,18 @@ class DriveClient:
                     )
             else:
                 logger.debug("[%s] Creating writer permission for %s", self.label, target_email)
-                created = self.service.permissions().create(
-                    fileId=file_id,
-                    body={
-                        "type": "user",
-                        "role": "writer",
-                        "emailAddress": target_email,
-                    },
-                    fields="id",
-                ).execute()
+                created = self._execute(
+                    self.service.permissions().create(
+                        fileId=file_id,
+                        body={
+                            "type": "user",
+                            "role": "writer",
+                            "emailAddress": target_email,
+                        },
+                        fields="id",
+                    ),
+                    f"Create writer permission for file {file_id}",
+                )
                 perm_id = created["id"]
 
             result = self._mark_pending_owner(file_id, perm_id, target_email)
@@ -575,7 +614,10 @@ class DriveClient:
         source_email is used for logging only.
         """
         # Find the permission id for the currently authenticated target account.
-        about = self.service.about().get(fields="user(emailAddress)").execute()
+        about = self._execute(
+            self.service.about().get(fields="user(emailAddress)"),
+            "Get target account email",
+        )
         my_email = about["user"]["emailAddress"]
 
         my_perm = self._find_permission(file_id, my_email)
@@ -586,7 +628,7 @@ class DriveClient:
             )
 
         try:
-            result = (
+            result = self._execute(
                 self.service.permissions()
                 .update(
                     fileId=file_id,
@@ -594,8 +636,8 @@ class DriveClient:
                     body={"role": "owner"},
                     transferOwnership=True,
                     fields="id, emailAddress, role",
-                )
-                .execute()
+                ),
+                f"Accept ownership transfer for file {file_id}",
             )
         except HttpError as exc:
             logger.error(
@@ -638,10 +680,13 @@ class DriveClient:
             return False
 
         try:
-            self.service.permissions().delete(
-                fileId=file_id,
-                permissionId=perm["id"],
-            ).execute()
+            self._execute(
+                self.service.permissions().delete(
+                    fileId=file_id,
+                    permissionId=perm["id"],
+                ),
+                f"Remove access for file {file_id}",
+            )
         except HttpError as exc:
             logger.error(
                 "[%s] Failed to remove access for %s on file %s: %s",
