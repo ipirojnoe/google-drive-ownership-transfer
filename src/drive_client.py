@@ -299,6 +299,44 @@ class DriveClient:
         )
         return response.get("files", []), response.get("nextPageToken")
 
+    def list_pending_ownership_items(
+        self,
+        source_email: str,
+        *,
+        page_token: str | None = None,
+        page_size: int = CLEANUP_PAGE_SIZE,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        kwargs: dict[str, Any] = {
+            "pageSize": page_size,
+            "q": "trashed = false and 'me' in writers",
+            "fields": "nextPageToken, files(id, name, mimeType, size, owners(emailAddress))",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        response = self._execute(
+            self.service.files().list(**kwargs),
+            "List pending ownership candidates",
+        )
+
+        source_email_lower = source_email.lower()
+        my_email = self.get_my_email().lower()
+        pending_items = []
+
+        for item in response.get("files", []):
+            owners = item.get("owners", [])
+            if not any(
+                owner.get("emailAddress", "").lower() == source_email_lower
+                for owner in owners
+            ):
+                continue
+
+            permission = self._find_permission(item["id"], my_email)
+            if permission and permission.get("pendingOwner"):
+                pending_items.append(item)
+
+        return pending_items, response.get("nextPageToken")
+
     def _is_owned_by_me(self, item: dict[str, Any]) -> bool:
         my_email = self.get_my_email().lower()
         owners = item.get("owners", [])

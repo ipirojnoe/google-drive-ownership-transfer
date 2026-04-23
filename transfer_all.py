@@ -291,6 +291,80 @@ def transfer_or_stop(
     raise SharingQuotaExceededError("sharing quota still exceeded after cleanup retries")
 
 
+def accept_pending_ownership_transfers(
+    target_client: DriveClient,
+    source_email: str,
+    *,
+    dry_run: bool,
+    remove_source_access: bool,
+    failed: list[dict],
+) -> int:
+    accepted = 0
+    page_token = None
+    page_num = 0
+
+    while True:
+        page_num += 1
+        pending_items, page_token = target_client.list_pending_ownership_items(
+            source_email,
+            page_token=page_token,
+        )
+        if pending_items:
+            logger.info(
+                "Manual pending ownership page %d: %d item(s)",
+                page_num,
+                len(pending_items),
+            )
+
+        for item in pending_items:
+            file_id = item["id"]
+            file_name = item.get("name", file_id)
+
+            if dry_run:
+                logger.info(
+                    "  pending: %s  '%s'",
+                    fmt_size(item.get("size")),
+                    file_name,
+                )
+                continue
+
+            logger.info(
+                "Accepting manual ownership transfer: %s  '%s'",
+                fmt_size(item.get("size")),
+                file_name,
+            )
+            try:
+                target_client.accept_ownership_transfer(file_id, source_email)
+                accepted += 1
+
+                if remove_source_access:
+                    removed = target_client.remove_access(file_id, source_email)
+                    if removed:
+                        logger.info("  ✓ accepted manual transfer, source access removed")
+                    else:
+                        logger.info(
+                            "  ✓ accepted manual transfer, source retained inherited access only"
+                        )
+                else:
+                    logger.info("  ✓ accepted manual transfer")
+            except Exception as exc:
+                logger.warning("  ✗ manual transfer accept error: %s", exc)
+                failed.append({
+                    "id": file_id,
+                    "name": file_name,
+                    "size": item.get("size"),
+                    "is_folder": item.get("mimeType") == FOLDER_MIME,
+                    "error": str(exc),
+                })
+
+            time.sleep(DELAY_BETWEEN_FILES)
+
+        if not page_token:
+            break
+
+    return accepted
+
+
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
@@ -323,8 +397,20 @@ def main() -> None:
     target_client = DriveClient(target_creds, account_label="target")
 
     transferred = 0
+    accepted_manual = 0
     failed: list[dict] = []
     stopped_due_to_quota = False
+
+    logger.info("Checking manually pending ownership transfers...")
+    accepted_manual = accept_pending_ownership_transfers(
+        target_client,
+        source_email,
+        dry_run=dry_run,
+        remove_source_access=remove_source_access,
+        failed=failed,
+    )
+    if accepted_manual:
+        logger.info("Accepted manual ownership transfers: %d", accepted_manual)
 
     try:
         if stream:
@@ -436,6 +522,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     logger.info("=" * 60)
     logger.info("SUMMARY:")
+    logger.info("  Manual accepted: %d", accepted_manual)
     logger.info("  Transferred: %d", transferred)
     logger.info("  Failed:      %d", len(failed))
     if failed:

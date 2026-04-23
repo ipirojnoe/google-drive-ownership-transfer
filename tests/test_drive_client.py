@@ -6,7 +6,13 @@ from googleapiclient.errors import HttpError
 
 from src.drive_client import DriveClient, SharingQuotaExceededError
 from src.retry import is_transient_error, retry_transient
-from transfer_all import get_next_stream_item, get_remaining_stream_items, transfer_item, transfer_or_stop
+from transfer_all import (
+    accept_pending_ownership_transfers,
+    get_next_stream_item,
+    get_remaining_stream_items,
+    transfer_item,
+    transfer_or_stop,
+)
 
 
 class FakeHttpResponse:
@@ -576,6 +582,56 @@ class DriveClientRemoveAccessTests(TestCase):
         client.remove_access.assert_not_called()
 
 
+class DriveClientPendingOwnershipTests(TestCase):
+    def test_list_pending_ownership_items_filters_by_source_and_pending_owner(self):
+        client = DriveClient.__new__(DriveClient)
+        client.label = "target"
+        client._my_email = "target@example.com"
+        files_api = Mock()
+        files_api.list.return_value = FakeRequest(
+            response={
+                "files": [
+                    {
+                        "id": "file-1",
+                        "name": "Pending",
+                        "owners": [{"emailAddress": "source@example.com"}],
+                    },
+                    {
+                        "id": "file-2",
+                        "name": "Not pending",
+                        "owners": [{"emailAddress": "source@example.com"}],
+                    },
+                    {
+                        "id": "file-3",
+                        "name": "Other owner",
+                        "owners": [{"emailAddress": "other@example.com"}],
+                    },
+                ],
+                "nextPageToken": "next-page",
+            }
+        )
+        service = Mock()
+        service.files.return_value = files_api
+        client.service = service
+        client._find_permission = Mock(
+            side_effect=[
+                {"id": "perm-1", "emailAddress": "target@example.com", "pendingOwner": True},
+                {"id": "perm-2", "emailAddress": "target@example.com", "pendingOwner": False},
+            ]
+        )
+
+        items, page_token = client.list_pending_ownership_items(
+            "source@example.com",
+            page_token="page-1",
+        )
+
+        self.assertEqual([item["id"] for item in items], ["file-1"])
+        self.assertEqual(page_token, "next-page")
+        files_api.list.assert_called_once()
+        self.assertEqual(files_api.list.call_args.kwargs["pageToken"], "page-1")
+        self.assertEqual(client._find_permission.call_count, 2)
+
+
 class TransferItemTests(TestCase):
     def test_does_not_fail_when_source_access_is_only_inherited(self):
         source_client = Mock()
@@ -781,6 +837,69 @@ class TransferItemTests(TestCase):
                     True,
                     failed,
                 )
+
+
+class PendingOwnershipTransferTests(TestCase):
+    def test_accepts_pending_ownership_transfers_and_removes_source_access(self):
+        target_client = Mock()
+        target_client.list_pending_ownership_items.side_effect = [
+            ([
+                {
+                    "id": "file-10",
+                    "name": "Manual",
+                    "size": "100",
+                    "mimeType": "application/octet-stream",
+                }
+            ], None)
+        ]
+        target_client.remove_access.return_value = True
+
+        failed: list[dict] = []
+        with patch("transfer_all.time.sleep", return_value=None):
+            accepted = accept_pending_ownership_transfers(
+                target_client,
+                "source@example.com",
+                dry_run=False,
+                remove_source_access=True,
+                failed=failed,
+            )
+
+        self.assertEqual(accepted, 1)
+        self.assertEqual(failed, [])
+        target_client.accept_ownership_transfer.assert_called_once_with(
+            "file-10",
+            "source@example.com",
+        )
+        target_client.remove_access.assert_called_once_with(
+            "file-10",
+            "source@example.com",
+        )
+
+    def test_dry_run_lists_pending_ownership_transfers_without_accepting(self):
+        target_client = Mock()
+        target_client.list_pending_ownership_items.return_value = (
+            [{
+                "id": "file-10",
+                "name": "Manual",
+                "size": "100",
+                "mimeType": "application/octet-stream",
+            }],
+            None,
+        )
+
+        failed: list[dict] = []
+        accepted = accept_pending_ownership_transfers(
+            target_client,
+            "source@example.com",
+            dry_run=True,
+            remove_source_access=True,
+            failed=failed,
+        )
+
+        self.assertEqual(accepted, 0)
+        self.assertEqual(failed, [])
+        target_client.accept_ownership_transfer.assert_not_called()
+        target_client.remove_access.assert_not_called()
 
 
 class StreamOrderingTests(TestCase):

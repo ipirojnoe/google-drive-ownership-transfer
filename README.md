@@ -70,6 +70,7 @@ graph TD
 Short version:
 - In normal mode, the script fetches everything first and transfers in global size order.
 - In stream mode, after each new page it transfers the largest item seen so far, then after pagination ends it transfers the remaining items in global size order.
+- Before transferring source-owned items, the target account accepts pending ownership transfers that were initiated manually from the source account.
 - If the target account only has inherited access, the script temporarily moves the item into a staging folder so Drive will allow `pendingOwner`.
 - After the target accepts ownership, the script restores the original parent folders.
 - If `REMOVE_SOURCE_ACCESS=1`, the script removes direct source access when possible. Inherited access on parent folders cannot be deleted at file level.
