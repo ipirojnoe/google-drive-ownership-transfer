@@ -73,7 +73,7 @@ Short version:
 - If the target account only has inherited access, the script temporarily moves the item into a staging folder so Drive will allow `pendingOwner`.
 - After the target accepts ownership, the script restores the original parent folders.
 - If `REMOVE_SOURCE_ACCESS=1`, the script removes direct source access when possible. Inherited access on parent folders cannot be deleted at file level.
-- If Google returns `sharingRateLimitExceeded`, the script switches to cleanup mode on the target account: it scans folders shared with the source first, then files, removes direct source access where possible, and retries the blocked item.
+- If Google returns `sharingRateLimitExceeded`, the script switches to cleanup mode on the target account: it scans folders shared with the source first, then files, removes direct source access where possible, follows inherited permissions back to target-owned parent folders, and retries the blocked item.
 - Transient DNS, SSL, timeout, and retryable Google API errors are retried automatically. If a run is interrupted and stream mode still has an already-transferred item in memory, the script checks current ownership and skips it.
 
 **Before you run**

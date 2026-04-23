@@ -107,7 +107,7 @@ class DriveClient:
                 fields=(
                     "permissions("
                     "id, emailAddress, role, type, pendingOwner, "
-                    "permissionDetails(permissionType, role, inherited)"
+                    "permissionDetails(permissionType, role, inherited, inheritedFrom)"
                     ")"
                 ),
             ),
@@ -133,7 +133,7 @@ class DriveClient:
                 permissionId=permission_id,
                 fields=(
                     "id, emailAddress, role, type, pendingOwner, "
-                    "permissionDetails(permissionType, role, inherited)"
+                    "permissionDetails(permissionType, role, inherited, inheritedFrom)"
                 ),
             ),
             f"Get permission {permission_id} for file {file_id}",
@@ -156,6 +156,16 @@ class DriveClient:
             for detail in self._permission_details(permission)
             if not detail.get("inherited", False)
         }
+
+    def _inherited_from_ids(self, permission: dict[str, Any] | None) -> list[str]:
+        inherited_from_ids = []
+        for detail in self._permission_details(permission):
+            if not detail.get("inherited", False):
+                continue
+            inherited_from = detail.get("inheritedFrom")
+            if inherited_from and inherited_from not in inherited_from_ids:
+                inherited_from_ids.append(inherited_from)
+        return inherited_from_ids
 
     def get_file(self, file_id: str, fields: str) -> dict[str, Any]:
         return self._execute(
@@ -357,7 +367,11 @@ class DriveClient:
                     )
                     continue
 
-                removed_access = self.remove_access(item["id"], source_email)
+                removed_access = self.remove_access(
+                    item["id"],
+                    source_email,
+                    resolve_inherited=True,
+                )
                 if removed_access:
                     removed += 1
                     logger.info(
@@ -395,9 +409,18 @@ class DriveClient:
 
         original_parents = self.get_parents(file_id)
         if not original_parents:
-            raise ValueError(
-                f"File {file_id} requires the staging workaround but has no parent folders"
+            logger.warning(
+                "[%s] File %s has inherited access for %s but no parent folders; "
+                "skipping staging and creating a direct permission instead",
+                self.label,
+                file_id,
+                target_email,
             )
+            return {
+                "staged": False,
+                "original_parents": [],
+                "staging_parent": None,
+            }
 
         staging_parent = self._ensure_staging_folder()
         logger.info(
@@ -540,7 +563,27 @@ class DriveClient:
                     )
                     return existing
 
-                if existing.get("role") != "writer":
+                if not self._has_direct_permission(existing):
+                    logger.debug(
+                        "[%s] Creating direct writer permission for %s because current "
+                        "permission is inherited-only",
+                        self.label,
+                        target_email,
+                    )
+                    created = self._execute(
+                        self.service.permissions().create(
+                            fileId=file_id,
+                            body={
+                                "type": "user",
+                                "role": "writer",
+                                "emailAddress": target_email,
+                            },
+                            fields="id",
+                        ),
+                        f"Create direct writer permission for file {file_id}",
+                    )
+                    perm_id = created["id"]
+                elif existing.get("role") != "writer":
                     logger.debug(
                         "[%s] Updating permission id=%s to writer for %s",
                         self.label,
@@ -656,34 +699,17 @@ class DriveClient:
     # Remove access for a given email (called as the new owner)
     # ------------------------------------------------------------------
 
-    def remove_access(self, file_id: str, email: str) -> bool:
-        """
-        Remove the permission for `email` from `file_id`.
-        Must be called by a client that owns the file.
-        """
-        perm = self._find_permission(file_id, email)
-        if not perm:
-            logger.debug(
-                "[%s] No permission for %s on file %s - skipping delete",
-                self.label, email, file_id,
-            )
-            return False
-
-        if not self._has_direct_permission(perm):
-            logger.warning(
-                "[%s] Cannot remove access for %s on file %s: permission is inherited, "
-                "the source of access lives on a parent folder",
-                self.label,
-                email,
-                file_id,
-            )
-            return False
-
+    def _delete_permission(
+        self,
+        file_id: str,
+        permission_id: str,
+        email: str,
+    ) -> None:
         try:
             self._execute(
                 self.service.permissions().delete(
                     fileId=file_id,
-                    permissionId=perm["id"],
+                    permissionId=permission_id,
                 ),
                 f"Remove access for file {file_id}",
             )
@@ -698,4 +724,126 @@ class DriveClient:
             "[%s] Access removed: %s no longer has access to file %s",
             self.label, email, file_id,
         )
+
+    def _remove_inherited_access_source(
+        self,
+        file_id: str,
+        email: str,
+        permission: dict[str, Any],
+        visited: set[str] | None = None,
+    ) -> bool:
+        if visited is None:
+            visited = set()
+        visited.add(file_id)
+
+        parent_ids = self._inherited_from_ids(permission)
+        if not parent_ids:
+            try:
+                parent_ids = self.get_parents(file_id)
+            except HttpError as exc:
+                logger.warning(
+                    "[%s] Cannot inspect parent folders for inherited access on file %s: %s",
+                    self.label,
+                    file_id,
+                    exc,
+                )
+                return False
+
+        for parent_id in parent_ids:
+            if parent_id in visited:
+                continue
+
+            try:
+                parent = self.get_file(parent_id, "id, name, owners(emailAddress)")
+            except HttpError as exc:
+                logger.warning(
+                    "[%s] Cannot inspect inherited access source %s for file %s: %s",
+                    self.label,
+                    parent_id,
+                    file_id,
+                    exc,
+                )
+                continue
+
+            if not self._is_owned_by_me(parent):
+                logger.warning(
+                    "[%s] Cannot remove inherited access for %s on file %s: "
+                    "parent folder '%s' (%s) is not owned by this account",
+                    self.label,
+                    email,
+                    file_id,
+                    parent.get("name", parent_id),
+                    parent_id,
+                )
+                continue
+
+            parent_perm = self._find_permission(parent_id, email)
+            if not parent_perm:
+                logger.debug(
+                    "[%s] No permission for %s on inherited access source %s",
+                    self.label,
+                    email,
+                    parent_id,
+                )
+                continue
+
+            if self._has_direct_permission(parent_perm):
+                self._delete_permission(parent_id, parent_perm["id"], email)
+                logger.info(
+                    "[%s] Removed inherited access for %s on file %s at parent folder '%s' (%s)",
+                    self.label,
+                    email,
+                    file_id,
+                    parent.get("name", parent_id),
+                    parent_id,
+                )
+                return True
+
+            if self._remove_inherited_access_source(
+                parent_id,
+                email,
+                parent_perm,
+                visited,
+            ):
+                return True
+
+        return False
+
+    def remove_access(
+        self,
+        file_id: str,
+        email: str,
+        *,
+        resolve_inherited: bool = False,
+    ) -> bool:
+        """
+        Remove the permission for `email` from `file_id`.
+        Must be called by a client that owns the file.
+        """
+        perm = self._find_permission(file_id, email)
+        if not perm:
+            logger.debug(
+                "[%s] No permission for %s on file %s - skipping delete",
+                self.label, email, file_id,
+            )
+            return False
+
+        if not self._has_direct_permission(perm):
+            if resolve_inherited and self._remove_inherited_access_source(
+                file_id,
+                email,
+                perm,
+            ):
+                return True
+
+            logger.warning(
+                "[%s] Cannot remove access for %s on file %s: permission is inherited, "
+                "the source of access lives on a parent folder",
+                self.label,
+                email,
+                file_id,
+            )
+            return False
+
+        self._delete_permission(file_id, perm["id"], email)
         return True

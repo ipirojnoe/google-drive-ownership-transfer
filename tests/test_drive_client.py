@@ -173,6 +173,36 @@ class DriveClientInitiateOwnershipTransferTests(TestCase):
         ]
         self.assertEqual(len(role_updates), 1)
 
+    def test_creates_direct_writer_for_inherited_only_permission(self):
+        permissions_api = FakePermissionsApi()
+        permissions_api.permission.update(
+            {
+                "id": "perm-inherited",
+                "role": "writer",
+                "pendingOwner": False,
+                "permissionDetails": [
+                    {"permissionType": "file", "role": "writer", "inherited": True}
+                ],
+            }
+        )
+        client = DriveClient.__new__(DriveClient)
+        client._credentials = None
+        client.service = FakeService(permissions_api)
+        client.label = "source"
+
+        with patch("src.drive_client.time.sleep", return_value=None):
+            client.initiate_ownership_transfer("file-2", "target@example.com")
+
+        self.assertEqual(len(permissions_api.create_calls), 1)
+        self.assertEqual(
+            permissions_api.create_calls[0]["body"],
+            {
+                "type": "user",
+                "role": "writer",
+                "emailAddress": "target@example.com",
+            },
+        )
+
 
 class DriveClientStageItemTests(TestCase):
     def test_skips_staging_for_direct_permission(self):
@@ -242,6 +272,36 @@ class DriveClientStageItemTests(TestCase):
             "file-2", "target@example.com"
         )
 
+    def test_skips_staging_for_inherited_permission_without_parents(self):
+        client = DriveClient.__new__(DriveClient)
+        client.label = "source"
+        client._find_permission = Mock(
+            return_value={
+                "id": "perm-1",
+                "emailAddress": "target@example.com",
+                "role": "writer",
+                "permissionDetails": [
+                    {"permissionType": "file", "role": "writer", "inherited": True}
+                ],
+            }
+        )
+        client.get_parents = Mock(return_value=[])
+        client._ensure_staging_folder = Mock()
+        client.move_item = Mock()
+
+        result = client.stage_item_if_needed("file-2", "target@example.com")
+
+        self.assertEqual(
+            result,
+            {
+                "staged": False,
+                "original_parents": [],
+                "staging_parent": None,
+            },
+        )
+        client._ensure_staging_folder.assert_not_called()
+        client.move_item.assert_not_called()
+
 
 class DriveClientRemoveAccessTests(TestCase):
     def test_skips_inherited_permission_delete(self):
@@ -293,8 +353,16 @@ class DriveClientRemoveAccessTests(TestCase):
         removed = client.cleanup_source_access("source@example.com", limit=10)
 
         self.assertEqual(removed, 2)
-        client.remove_access.assert_any_call("folder-1", "source@example.com")
-        client.remove_access.assert_any_call("file-1", "source@example.com")
+        client.remove_access.assert_any_call(
+            "folder-1",
+            "source@example.com",
+            resolve_inherited=True,
+        )
+        client.remove_access.assert_any_call(
+            "file-1",
+            "source@example.com",
+            resolve_inherited=True,
+        )
         self.assertEqual(client.remove_access.call_args_list[0].args[0], "folder-1")
         self.assertEqual(client.remove_access.call_args_list[1].args[0], "file-1")
 
@@ -332,6 +400,158 @@ class DriveClientRemoveAccessTests(TestCase):
         self.assertEqual(client.remove_access.call_count, 2)
         self.assertEqual(client.remove_access.call_args_list[0].args[0], "folder-1")
         self.assertEqual(client.remove_access.call_args_list[1].args[0], "folder-2")
+
+    def test_remove_access_can_delete_inherited_permission_from_owned_parent(self):
+        client = DriveClient.__new__(DriveClient)
+        client.label = "target"
+        client._my_email = "target@example.com"
+        client._find_permission = Mock(
+            side_effect=[
+                {
+                    "id": "perm-child",
+                    "emailAddress": "source@example.com",
+                    "role": "writer",
+                    "permissionDetails": [
+                        {
+                            "permissionType": "file",
+                            "role": "writer",
+                            "inherited": True,
+                            "inheritedFrom": "parent-1",
+                        }
+                    ],
+                },
+                {
+                    "id": "perm-parent",
+                    "emailAddress": "source@example.com",
+                    "role": "writer",
+                    "permissionDetails": [
+                        {
+                            "permissionType": "file",
+                            "role": "writer",
+                            "inherited": False,
+                        }
+                    ],
+                },
+            ]
+        )
+        client.get_file = Mock(
+            return_value={
+                "id": "parent-1",
+                "name": "Parent",
+                "owners": [{"emailAddress": "target@example.com"}],
+            }
+        )
+        client._delete_permission = Mock()
+
+        removed = client.remove_access(
+            "file-3",
+            "source@example.com",
+            resolve_inherited=True,
+        )
+
+        self.assertTrue(removed)
+        client.get_file.assert_called_once_with(
+            "parent-1",
+            "id, name, owners(emailAddress)",
+        )
+        client._delete_permission.assert_called_once_with(
+            "parent-1",
+            "perm-parent",
+            "source@example.com",
+        )
+
+    def test_remove_access_does_not_delete_inherited_permission_from_unowned_parent(self):
+        client = DriveClient.__new__(DriveClient)
+        client.label = "target"
+        client._my_email = "target@example.com"
+        client._find_permission = Mock(
+            return_value={
+                "id": "perm-child",
+                "emailAddress": "source@example.com",
+                "role": "writer",
+                "permissionDetails": [
+                    {
+                        "permissionType": "file",
+                        "role": "writer",
+                        "inherited": True,
+                        "inheritedFrom": "parent-1",
+                    }
+                ],
+            }
+        )
+        client.get_file = Mock(
+            return_value={
+                "id": "parent-1",
+                "name": "Parent",
+                "owners": [{"emailAddress": "other@example.com"}],
+            }
+        )
+        client._delete_permission = Mock()
+
+        removed = client.remove_access(
+            "file-3",
+            "source@example.com",
+            resolve_inherited=True,
+        )
+
+        self.assertFalse(removed)
+        client._delete_permission.assert_not_called()
+
+    def test_remove_access_falls_back_to_file_parents_when_inherited_from_is_missing(self):
+        client = DriveClient.__new__(DriveClient)
+        client.label = "target"
+        client._my_email = "target@example.com"
+        client._find_permission = Mock(
+            side_effect=[
+                {
+                    "id": "perm-child",
+                    "emailAddress": "source@example.com",
+                    "role": "writer",
+                    "permissionDetails": [
+                        {
+                            "permissionType": "file",
+                            "role": "writer",
+                            "inherited": True,
+                        }
+                    ],
+                },
+                {
+                    "id": "perm-parent",
+                    "emailAddress": "source@example.com",
+                    "role": "writer",
+                    "permissionDetails": [
+                        {
+                            "permissionType": "file",
+                            "role": "writer",
+                            "inherited": False,
+                        }
+                    ],
+                },
+            ]
+        )
+        client.get_parents = Mock(return_value=["parent-1"])
+        client.get_file = Mock(
+            return_value={
+                "id": "parent-1",
+                "name": "Parent",
+                "owners": [{"emailAddress": "target@example.com"}],
+            }
+        )
+        client._delete_permission = Mock()
+
+        removed = client.remove_access(
+            "file-3",
+            "source@example.com",
+            resolve_inherited=True,
+        )
+
+        self.assertTrue(removed)
+        client.get_parents.assert_called_once_with("file-3")
+        client._delete_permission.assert_called_once_with(
+            "parent-1",
+            "perm-parent",
+            "source@example.com",
+        )
 
     def test_cleanup_skips_items_not_owned_by_target(self):
         client = DriveClient.__new__(DriveClient)
