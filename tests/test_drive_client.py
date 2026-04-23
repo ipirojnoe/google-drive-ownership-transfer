@@ -124,6 +124,9 @@ class RetryTests(TestCase):
         self.assertTrue(is_transient_error(make_http_error("rateLimitExceeded")))
         self.assertFalse(is_transient_error(make_http_error("sharingRateLimitExceeded")))
 
+    def test_classifies_connection_reset_as_transient(self):
+        self.assertTrue(is_transient_error(ConnectionResetError("connection reset")))
+
 
 class DriveClientInitiateOwnershipTransferTests(TestCase):
     def test_waits_for_writer_before_marking_pending_owner(self):

@@ -1,3 +1,4 @@
+import errno
 import random
 import socket
 import ssl
@@ -28,6 +29,22 @@ TRANSIENT_HTTP_REASONS = {
     "userRateLimitExceeded",
 }
 
+TRANSIENT_OS_ERRORS = {
+    errno.ECONNABORTED,
+    errno.ECONNREFUSED,
+    errno.ECONNRESET,
+    errno.EHOSTUNREACH,
+    errno.ENETUNREACH,
+    errno.ETIMEDOUT,
+}
+
+TRANSIENT_BUILTIN_ERRORS = (
+    ConnectionAbortedError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    TimeoutError,
+)
+
 
 def _http_error_reason(exc: HttpError) -> str | None:
     try:
@@ -49,6 +66,12 @@ def is_transient_error(exc: BaseException) -> bool:
         status = getattr(exc.resp, "status", None)
         reason = _http_error_reason(exc)
         return status in TRANSIENT_HTTP_STATUSES or reason in TRANSIENT_HTTP_REASONS
+
+    if isinstance(exc, TRANSIENT_BUILTIN_ERRORS):
+        return True
+
+    if isinstance(exc, OSError) and exc.errno in TRANSIENT_OS_ERRORS:
+        return True
 
     return isinstance(
         exc,
