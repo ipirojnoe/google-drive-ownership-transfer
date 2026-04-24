@@ -1,3 +1,4 @@
+import logging
 import time
 import json
 from typing import Any
@@ -6,10 +7,9 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 
-from src.logger import get_logger
-from src.retry import retry_transient
+from retry import retry_transient
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 WRITER_ROLE_WAIT_TIMEOUT = 20.0
 WRITER_ROLE_POLL_INTERVAL = 1.0

@@ -123,5 +123,22 @@ The script authenticates the source account, lists the latest 10 files, initiate
 ./.venv/bin/python transfer_all.py
 ```
 
+**Mutation tests**
+Run the regular tests first, then launch `mutmut`:
+
+```bash
+./.venv/bin/python3.14 -m pytest -q
+./.venv/bin/python3.14 -m mutmut run
+```
+
+Useful follow-up commands:
+
+```bash
+./.venv/bin/python3.14 -m mutmut results
+./.venv/bin/python3.14 -m mutmut show <mutant>
+```
+
+`mutmut` writes its working files to `mutants/`.
+
 **License**
 `0BSD` (BSD Zero Clause). Use it for any purpose without attribution requirements.

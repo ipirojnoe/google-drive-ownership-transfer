@@ -1,13 +1,13 @@
+import logging
 from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from src.logger import get_logger
-from src.retry import retry_transient
+from retry import retry_transient
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Full Drive access is required to transfer ownership
 SCOPES = ["https://www.googleapis.com/auth/drive"]

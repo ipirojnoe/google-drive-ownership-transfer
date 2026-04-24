@@ -15,6 +15,7 @@ Requirements:
   - Optionally put the target OAuth client at credentials/client_secret_target.json
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -23,14 +24,15 @@ import os
 
 load_dotenv()
 
-# Add the project root so `src.*` imports work when the script is run directly.
-sys.path.insert(0, str(Path(__file__).parent))
+# Add the source directory so project modules can be imported when the script
+# is run directly.
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from src.auth import get_credentials, CREDENTIALS_DIR
-from src.drive_client import DriveClient
-from src.logger import get_logger
+from auth import get_credentials, CREDENTIALS_DIR
+from drive_client import DriveClient
+from logger import get_logger
 
-logger = get_logger("test_connection")
+logger = logging.getLogger("test_connection")
 
 
 def fmt_size(size: str | None) -> str:
@@ -45,6 +47,8 @@ def fmt_size(size: str | None) -> str:
 
 
 def main() -> None:
+    get_logger("test_connection")
+
     source_email = os.getenv("SOURCE_EMAIL")
     target_email = os.getenv("TARGET_EMAIL")
 

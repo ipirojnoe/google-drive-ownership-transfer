@@ -1,11 +1,21 @@
+import sys
+from pathlib import Path
 import socket
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from googleapiclient.errors import HttpError
 
-from src.drive_client import DriveClient, SharingQuotaExceededError
-from src.retry import is_transient_error, retry_transient
+context_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(context_root / "src"))
+
+project_root = context_root
+if not (project_root / "transfer_all.py").exists():
+    project_root = Path(__file__).resolve().parents[2]
+sys.path.append(str(project_root))
+
+from drive_client import DriveClient, SharingQuotaExceededError
+from retry import is_transient_error, retry_transient
 from transfer_all import (
     accept_pending_ownership_transfers,
     get_next_stream_item,
@@ -118,7 +128,7 @@ class RetryTests(TestCase):
                 raise socket.gaierror("temporary dns failure")
             return "ok"
 
-        with patch("src.retry.time.sleep", return_value=None):
+        with patch("retry.time.sleep", return_value=None):
             self.assertEqual(
                 retry_transient("test operation", operation, attempts=2, base_delay=0),
                 "ok",
@@ -142,7 +152,7 @@ class DriveClientInitiateOwnershipTransferTests(TestCase):
         client.service = FakeService(permissions_api)
         client.label = "source"
 
-        with patch("src.drive_client.time.sleep", return_value=None):
+        with patch("drive_client.time.sleep", return_value=None):
             result = client.initiate_ownership_transfer("file-1", "target@example.com")
 
         self.assertTrue(result["pendingOwner"])
@@ -170,7 +180,7 @@ class DriveClientInitiateOwnershipTransferTests(TestCase):
         client.service = FakeService(permissions_api)
         client.label = "source"
 
-        with patch("src.drive_client.time.sleep", return_value=None):
+        with patch("drive_client.time.sleep", return_value=None):
             client.initiate_ownership_transfer("file-2", "target@example.com")
 
         self.assertEqual(len(permissions_api.create_calls), 0)
@@ -196,7 +206,7 @@ class DriveClientInitiateOwnershipTransferTests(TestCase):
         client.service = FakeService(permissions_api)
         client.label = "source"
 
-        with patch("src.drive_client.time.sleep", return_value=None):
+        with patch("drive_client.time.sleep", return_value=None):
             client.initiate_ownership_transfer("file-2", "target@example.com")
 
         self.assertEqual(len(permissions_api.create_calls), 1)

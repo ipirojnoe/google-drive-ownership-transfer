@@ -1,4 +1,5 @@
 import errno
+import logging
 import random
 import socket
 import ssl
@@ -11,9 +12,7 @@ import requests
 from google.auth.exceptions import TransportError
 from googleapiclient.errors import HttpError
 
-from src.logger import get_logger
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 

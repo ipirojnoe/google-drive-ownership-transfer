@@ -15,6 +15,7 @@ Run:
                            then finish the remaining items after full pagination
 """
 
+import logging
 import os
 import sys
 import time
@@ -27,13 +28,13 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from src.auth import get_credentials
-from src.drive_client import DriveClient, SharingQuotaExceededError, get_http_error_reason
-from src.logger import get_logger
+from auth import get_credentials
+from drive_client import DriveClient, SharingQuotaExceededError, get_http_error_reason
+from logger import get_logger
 
-logger = get_logger("transfer_all")
+logger = logging.getLogger("transfer_all")
 
 DELAY_BETWEEN_FILES = 0.3
 PAGE_SIZE = 500
@@ -638,6 +639,8 @@ def accept_pending_ownership_transfers(
 # ------------------------------------------------------------------
 
 def main() -> None:
+    get_logger("transfer_all")
+
     source_email, target_email, dry_run, remove_source_access, stream = read_runtime_config()
     log_run_configuration(
         source_email,
