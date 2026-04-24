@@ -145,7 +145,7 @@ class DriveClientInitiateOwnershipTransferTests(TestCase):
         with patch("src.drive_client.time.sleep", return_value=None):
             result = client.initiate_ownership_transfer("file-1", "target@example.com")
 
-        self.assertEqual(result["pendingOwner"], True)
+        self.assertTrue(result["pendingOwner"])
         self.assertEqual(len(permissions_api.create_calls), 0)
         self.assertGreaterEqual(len(permissions_api.get_calls), 2)
         self.assertEqual(permissions_api.pending_owner_attempts, 2)

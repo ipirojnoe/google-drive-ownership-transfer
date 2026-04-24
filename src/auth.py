@@ -40,11 +40,11 @@ def get_credentials(account: str) -> Credentials:
 
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-        logger.debug("Loaded cached token for account '%s'", account)
+        logger.debug("Loaded cached OAuth credentials")
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            logger.info("Refreshing token for account '%s'...", account)
+            logger.info("Refreshing cached OAuth credentials...")
             retry_transient(
                 f"Refresh token for account '{account}'",
                 lambda: creds.refresh(Request()),
@@ -58,6 +58,6 @@ def get_credentials(account: str) -> Credentials:
             creds = flow.run_local_server(port=0, open_browser=False)
 
         token_path.write_text(creds.to_json(), encoding="utf-8")
-        logger.info("Token saved: %s", token_path)
+        logger.info("Updated cached OAuth credentials")
 
     return creds

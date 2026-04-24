@@ -382,7 +382,7 @@ class DriveClient:
         page_token = None
 
         while limit is None or removed < limit:
-            page_size = CLEANUP_PAGE_SIZE if limit is None else min(CLEANUP_PAGE_SIZE, limit - removed)
+            page_size = self._cleanup_page_size(limit, removed)
             items, page_token = self._list_items_shared_with_user(
                 source_email,
                 folder_only=folder_only,
@@ -396,34 +396,62 @@ class DriveClient:
                 if limit is not None and removed >= limit:
                     break
 
-                if not self._is_owned_by_me(item):
-                    logger.debug(
-                        "[%s] Cleanup skipping %s '%s': not owned by current account",
-                        self.label,
-                        "folder" if folder_only else "file",
-                        item.get("name", item["id"]),
-                    )
-                    continue
-
-                removed_access = self.remove_access(
-                    item["id"],
-                    source_email,
-                    resolve_inherited=True,
-                )
-                if removed_access:
+                if self._cleanup_shared_item_access(item, source_email, folder_only, limit, removed):
                     removed += 1
-                    logger.info(
-                        "[%s] Cleanup removed source access from %s '%s'%s",
-                        self.label,
-                        "folder" if folder_only else "file",
-                        item.get("name", item["id"]),
-                        "" if limit is None else f" ({removed}/{limit})",
-                    )
 
             if not page_token:
                 break
 
         return removed
+
+    def _cleanup_page_size(self, limit: int | None, removed: int) -> int:
+        if limit is None:
+            return CLEANUP_PAGE_SIZE
+        return min(CLEANUP_PAGE_SIZE, limit - removed)
+
+    def _cleanup_item_label(self, folder_only: bool) -> str:
+        return "folder" if folder_only else "file"
+
+    def _cleanup_progress_suffix(self, limit: int | None, removed: int) -> str:
+        if limit is None:
+            return ""
+        return f" ({removed + 1}/{limit})"
+
+    def _cleanup_shared_item_access(
+        self,
+        item: dict[str, Any],
+        source_email: str,
+        folder_only: bool,
+        limit: int | None,
+        removed: int,
+    ) -> bool:
+        item_label = self._cleanup_item_label(folder_only)
+        item_name = item.get("name", item["id"])
+        if not self._is_owned_by_me(item):
+            logger.debug(
+                "[%s] Cleanup skipping %s '%s': not owned by current account",
+                self.label,
+                item_label,
+                item_name,
+            )
+            return False
+
+        removed_access = self.remove_access(
+            item["id"],
+            source_email,
+            resolve_inherited=True,
+        )
+        if not removed_access:
+            return False
+
+        logger.info(
+            "[%s] Cleanup removed source access from %s '%s'%s",
+            self.label,
+            item_label,
+            item_name,
+            self._cleanup_progress_suffix(limit, removed),
+        )
+        return True
 
     def stage_item_if_needed(
         self, file_id: str, target_email: str
@@ -774,78 +802,117 @@ class DriveClient:
             visited = set()
         visited.add(file_id)
 
-        parent_ids = self._inherited_from_ids(permission)
+        parent_ids = self._get_inherited_access_parent_ids(file_id, permission)
         if not parent_ids:
-            try:
-                parent_ids = self.get_parents(file_id)
-            except HttpError as exc:
-                logger.warning(
-                    "[%s] Cannot inspect parent folders for inherited access on file %s: %s",
-                    self.label,
-                    file_id,
-                    exc,
-                )
-                return False
+            return False
 
         for parent_id in parent_ids:
             if parent_id in visited:
                 continue
 
-            try:
-                parent = self.get_file(parent_id, "id, name, owners(emailAddress)")
-            except HttpError as exc:
-                logger.warning(
-                    "[%s] Cannot inspect inherited access source %s for file %s: %s",
-                    self.label,
-                    parent_id,
-                    file_id,
-                    exc,
-                )
+            parent = self._get_owned_parent_for_inherited_access(file_id, email, parent_id)
+            if parent is None:
                 continue
 
-            if not self._is_owned_by_me(parent):
-                logger.warning(
-                    "[%s] Cannot remove inherited access for %s on file %s: "
-                    "parent folder '%s' (%s) is not owned by this account",
-                    self.label,
-                    email,
-                    file_id,
-                    parent.get("name", parent_id),
-                    parent_id,
-                )
-                continue
-
-            parent_perm = self._find_permission(parent_id, email)
-            if not parent_perm:
-                logger.debug(
-                    "[%s] No permission for %s on inherited access source %s",
-                    self.label,
-                    email,
-                    parent_id,
-                )
-                continue
-
-            if self._has_direct_permission(parent_perm):
-                self._delete_permission(parent_id, parent_perm["id"], email)
-                logger.info(
-                    "[%s] Removed inherited access for %s on file %s at parent folder '%s' (%s)",
-                    self.label,
-                    email,
-                    file_id,
-                    parent.get("name", parent_id),
-                    parent_id,
-                )
-                return True
-
-            if self._remove_inherited_access_source(
-                parent_id,
+            if self._remove_inherited_access_from_parent(
+                file_id,
                 email,
-                parent_perm,
+                parent_id,
+                parent,
                 visited,
             ):
                 return True
 
         return False
+
+    def _get_inherited_access_parent_ids(
+        self,
+        file_id: str,
+        permission: dict[str, Any],
+    ) -> list[str]:
+        parent_ids = self._inherited_from_ids(permission)
+        if parent_ids:
+            return parent_ids
+
+        try:
+            return self.get_parents(file_id)
+        except HttpError as exc:
+            logger.warning(
+                "[%s] Cannot inspect parent folders for inherited access on file %s: %s",
+                self.label,
+                file_id,
+                exc,
+            )
+            return []
+
+    def _get_owned_parent_for_inherited_access(
+        self,
+        file_id: str,
+        email: str,
+        parent_id: str,
+    ) -> dict[str, Any] | None:
+        try:
+            parent = self.get_file(parent_id, "id, name, owners(emailAddress)")
+        except HttpError as exc:
+            logger.warning(
+                "[%s] Cannot inspect inherited access source %s for file %s: %s",
+                self.label,
+                parent_id,
+                file_id,
+                exc,
+            )
+            return None
+
+        if self._is_owned_by_me(parent):
+            return parent
+
+        logger.warning(
+            "[%s] Cannot remove inherited access for %s on file %s: "
+            "parent folder '%s' (%s) is not owned by this account",
+            self.label,
+            email,
+            file_id,
+            parent.get("name", parent_id),
+            parent_id,
+        )
+        return None
+
+    def _remove_inherited_access_from_parent(
+        self,
+        file_id: str,
+        email: str,
+        parent_id: str,
+        parent: dict[str, Any],
+        visited: set[str],
+    ) -> bool:
+        parent_perm = self._find_permission(parent_id, email)
+        if not parent_perm:
+            logger.debug(
+                "[%s] No permission for %s on inherited access source %s",
+                self.label,
+                email,
+                parent_id,
+            )
+            return False
+
+        if self._has_direct_permission(parent_perm):
+            self._delete_permission(parent_id, parent_perm["id"], email)
+            logger.info(
+                "[%s] Removed inherited access for %s on file %s at parent folder '%s' (%s)",
+                self.label,
+                email,
+                file_id,
+                parent.get("name", parent_id),
+                parent_id,
+            )
+            return True
+
+        return self._remove_inherited_access_source(
+            parent_id,
+            email,
+            parent_perm,
+            visited,
+        )
 
     def remove_access(
         self,
